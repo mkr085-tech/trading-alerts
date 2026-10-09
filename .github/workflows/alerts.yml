@@ -3,7 +3,7 @@ name: Trading Alerts
 on:
   schedule:
     # Every 5 min, Mon-Fri, 03:30-18:05 UTC = 09:00-23:35 IST
-    - cron: '*/5 3-18 * * 1-5'
+    - cron: '*/5 * * * *'
   workflow_dispatch:   # manual trigger button on GitHub
 
 jobs:
