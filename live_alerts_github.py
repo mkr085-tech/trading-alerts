@@ -44,8 +44,8 @@ CONFIG = {
     "strike_gap":        50,
 
     # Alert proximity
-    "nifty_prox":        3,
-    "crude_prox":        5,
+    "nifty_prox":        8,   # wider to catch levels near candle close
+    "crude_prox":        10,  # wider for crude bigger ticks
 
     # Gann degrees
     "nifty_degree":      45,
@@ -340,7 +340,18 @@ def process_instrument(candles_all, daily_candles, cfg, inst_name,
 
     # Session open + Gann
     if "sess_open" not in inst_state:
-        inst_state["sess_open"] = candles_today[0][1]  # open of first candle
+        # Find exact session start candle (09:00 for Crude, 09:15 for Nifty)
+        start_h = int(start.split(":")[0])
+        start_m = int(start.split(":")[1])
+        sess_candle = None
+        for c2 in candles_today:
+            ct = tz_ts(c2[0])
+            if ct.hour == start_h and ct.minute == start_m:
+                sess_candle = c2
+                break
+        if sess_candle is None:
+            sess_candle = candles_today[0]  # fallback
+        inst_state["sess_open"] = sess_candle[1]  # true session open
         degree = cfg.get(f"{inst_name.lower()}_degree",
                          cfg["nifty_degree"] if inst_name=="NIFTY" else cfg["crude_degree"])
         gann   = calc_gann(inst_state["sess_open"], degree)
@@ -369,18 +380,56 @@ def process_instrument(candles_all, daily_candles, cfg, inst_name,
     or_mins = cfg["nifty_pob_mins"] if inst_name=="NIFTY" else cfg["crude_pob_mins"]
     s_start = list(map(int, start.split(":")))
     elapsed = (now.hour - s_start[0])*60 + (now.minute - s_start[1])
+    # Crude phase 2 POB lock at 90 min (10:30)
+    pob_lock = cfg.get("crude_pob_lock") if inst_name == "CRUDE" else None
+    if (pob_lock and elapsed >= pob_lock and
+        "pob2" not in inst_state and "pob" in inst_state):
+        lock_end_m = start_h2*60 + start_m2 + pob_lock if False else                      int(start.split(":")[0])*60 + int(start.split(":")[1]) + pob_lock
+        or2_c = []
+        for c2 in candles_today:
+            ct    = tz_ts(c2[0])
+            c_min = ct.hour * 60 + ct.minute
+            if (int(start.split(":")[0])*60+int(start.split(":")[1])) <= c_min <= lock_end_m:
+                or2_c.append(c2)
+        if or2_c:
+            inst_state["pob"] = calc_pob(
+                max(c2[2] for c2 in or2_c),
+                min(c2[3] for c2 in or2_c))
+            inst_state["pob2"] = True
+            L(f"  [{inst_name}] POB2 locked at {pob_lock}min: "
+              f"OR={inst_state['pob']['or_high']}/{inst_state['pob']['or_low']}")
+            tg.send(
+                f"📐 <b>Crude POB Locked (90min)</b>\n"
+                f"OR: {inst_state['pob']['or_high']}/{inst_state['pob']['or_low']}\n"
+                f"ONM↑:{inst_state['pob']['UP']['ONM']}  "
+                f"ONM↓:{inst_state['pob']['DOWN']['ONM']}")
+
     if elapsed >= or_mins and "pob" not in inst_state:
-        or_c = [c for c in candles_today if elapsed_from_open(c[0], candles_today[0][0]) <= or_mins*60]
+        # Use EXACT session time window for OR
+        # e.g. Nifty: 09:15 to 09:30 only (not from first data candle)
+        start_h = int(start.split(":")[0])
+        start_m = int(start.split(":")[1])
+        or_end_m = start_h * 60 + start_m + or_mins
+        or_c = []
+        for c2 in candles_today:
+            ct    = tz_ts(c2[0])
+            c_min = ct.hour * 60 + ct.minute
+            if (start_h*60+start_m) <= c_min <= or_end_m:
+                or_c.append(c2)
         if or_c:
-            inst_state["pob"] = calc_pob(max(c[2] for c in or_c), min(c[3] for c in or_c))
+            inst_state["pob"] = calc_pob(
+                max(c2[2] for c2 in or_c),
+                min(c2[3] for c2 in or_c))
             L(f"  [{inst_name}] POB set OR={inst_state['pob']['or_high']}/{inst_state['pob']['or_low']}")
 
     # Swing zones lock at swing_lock time
     sw_lock = cfg["nifty_swing_lock"] if inst_name=="NIFTY" else cfg["crude_swing_lock"]
     sw_lock_mins = int(sw_lock.split(":")[0])*60 + int(sw_lock.split(":")[1])
     now_mins = now.hour*60 + now.minute
+    start_mins_val = int(start.split(":")[0])*60 + int(start.split(":")[1])
     if now_mins >= sw_lock_mins and "swing" not in inst_state:
-        window = [c for c in candles_today if tz_ts(c[0]).hour*60+tz_ts(c[0]).minute <= sw_lock_mins]
+        window = [c for c in candles_today
+                  if start_mins_val <= tz_ts(c[0]).hour*60+tz_ts(c[0]).minute <= sw_lock_mins]
         if window:
             inst_state["swing"] = calc_swing(window)
             L(f"  [{inst_name}] Swing locked: {inst_state['swing']}")
@@ -419,12 +468,32 @@ def process_instrument(candles_all, daily_candles, cfg, inst_name,
     cpr          = inst_state.get("cpr")
     alerts       = []
 
+    # Use candle HIGH and LOW to check if level was TOUCHED/CROSSED
+    # This catches levels even when close has moved past them
+    candle_high = latest[2]
+    candle_low  = latest[3]
+    prev_high   = prev_c[2] if prev_c else candle_high
+    prev_low    = prev_c[3] if prev_c else candle_low
+
+    def level_touched(lvl):
+        """True if current OR previous candle touched this level."""
+        curr_touch = candle_low <= lvl <= candle_high
+        prev_touch = prev_low  <= lvl <= prev_high
+        close_near = abs(price - lvl) <= prox
+        return curr_touch or prev_touch or close_near
+
+    def zone_touched(z_low, z_high):
+        """True if price entered this zone in current or previous candle."""
+        curr = not (candle_high < z_low or candle_low > z_high)
+        prev = not (prev_high  < z_low or prev_low  > z_high)
+        return curr or prev
+
     # Gann near
     gann_near = []
     for i, r in enumerate(gann.get("R",[])[:8], 1):
-        if abs(price-r) <= prox: gann_near.append((f"R{i}", r, "PE"))
+        if level_touched(r): gann_near.append((f"R{i}", r, "PE"))
     for i, s in enumerate(gann.get("S",[])[:8], 1):
-        if abs(price-s) <= prox: gann_near.append((f"S{i}", s, "CE"))
+        if level_touched(s): gann_near.append((f"S{i}", s, "CE"))
 
     # POB near
     pob_near = []
@@ -432,11 +501,11 @@ def process_instrument(candles_all, daily_candles, cfg, inst_name,
         for sk, pob_side, sign in [("UP",pob["UP"],"CE"),("DOWN",pob["DOWN"],"PE")]:
             for lbl in ["ONM","DEC","SL","T1","T6","T7","T8"]:
                 lvl = pob_side.get(lbl)
-                if lvl and abs(price-lvl) <= prox:
+                if lvl and level_touched(lvl):
                     pob_near.append((f"{sk} {lbl}", lvl, sign))
             for zk,zl in [("T23_zone","T2-T3"),("T45_zone","T4-T5")]:
                 z = pob_side.get(zk)
-                if z and z[0] <= price <= z[1]:
+                if z and zone_touched(z[0], z[1]):
                     pob_near.append((f"{sk} {zl} zone", (z[0]+z[1])/2, sign))
 
     # Confluence
@@ -528,7 +597,8 @@ def process_instrument(candles_all, daily_candles, cfg, inst_name,
     for a in sorted(alerts, key=lambda x: x["priority"]):
         key = a["key"]; lvl = a["level"]
         prev_alert = alerted.get(key, 0)
-        if prev_alert and abs(price - prev_alert) < 5: continue
+        # Allow re-alert if price has moved 15+ pts since last alert
+        if prev_alert and abs(price - prev_alert) < 15: continue
 
         alerted[key] = price
         direction     = a["direction"]
