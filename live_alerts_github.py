@@ -296,10 +296,18 @@ def tz_ts(ts_unix):
     return datetime.fromtimestamp(ts_unix, tz=timezone(timedelta(hours=5, minutes=30)))
 
 def in_session(t, start_str, end_str):
+    """Check if current IST time is within session hours."""
+    from datetime import timezone, timedelta
+    # Convert to IST
+    ist = timezone(timedelta(hours=5, minutes=30))
+    t_ist = datetime.now(tz=ist)
     start = list(map(int, start_str.split(":")))
     end   = list(map(int, end_str.split(":")))
-    h,m   = t.hour, t.minute
-    return (h*60+m) >= (start[0]*60+start[1]) and (h*60+m) <= (end[0]*60+end[1])
+    h,m   = t_ist.hour, t_ist.minute
+    now_mins   = h*60 + m
+    start_mins = start[0]*60 + start[1]
+    end_mins   = end[0]*60 + end[1]
+    return start_mins <= now_mins <= end_mins
 
 def process_instrument(candles_all, daily_candles, cfg, inst_name,
                        inst_state: dict, tg: Telegram, fd: FyersData,
